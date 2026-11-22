@@ -5,13 +5,21 @@ const bodyParser = require('body-parser');
 const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const http = require('http');
+const https = require('https');
 
 const app = express();
 
-// Helper function to prevent HTML Injection (XSS) in Emails
+// ==================== CONSTANTS ====================
+const OWNER_NAME = process.env.OWNER_NAME || 'Shuvro Rozario';
+const WAIT_FOR_EMAIL = process.env.WAIT_FOR_EMAIL === 'true'; // default: respond instantly
+
+// Render (and most hosts) sit behind a proxy. Needed for correct client IP + rate limiting.
+app.set('trust proxy', 1);
+
 function escapeHTML(str) {
   if (!str) return '';
-  return str.replace(/[&<>"']/g, function (match) {
+  return String(str).replace(/[&<>"']/g, function (match) {
     const chars = {
       '&': '&amp;',
       '<': '&lt;',
@@ -23,13 +31,13 @@ function escapeHTML(str) {
   });
 }
 
-// Security middleware
+// ==================== SECURITY MIDDLEWARE ====================
 app.use(helmet({
   crossOriginResourcePolicy: { policy: "cross-origin" },
   contentSecurityPolicy: false
 }));
 
-// CORS configuration
+// ==================== CORS CONFIGURATION ====================
 app.use(cors({
   origin: function (origin, callback) {
     const allowedOrigins = [
@@ -61,70 +69,347 @@ app.options('*', cors());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
-// Rate limiting to prevent Brute Force/DDoS on contact endpoint
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
-  message: { success: false, message: 'Too many requests from this IP, please try again later.' }
-});
-app.use(limiter);
-
-// ==================== BREVO SMTP CONFIGURATION (UPDATED) ====================
-const transporter = nodemailer.createTransport({
-  host: 'smtp-relay.brevo.com', // Brevo SMTP Server
-  port: 587,                    // Brevo TLS Port
-  secure: false,                // 587 পোর্টের জন্য false হবে, কিন্তু STARTTLS ব্যবহার করবে
-  pool: true,
-  maxConnections: 2,
-  maxMessages: Infinity,
-  connectionTimeout: 15000,
-  socketTimeout: 20000,
-  auth: {
-    user: process.env.EMAIL_USER, // Render-এর Environment-এ থাকবে: ad07a4001@smtp-brevo.com
-    pass: process.env.EMAIL_PASS, // Render-এর Environment-এ থাকবে আপনার Brevo API Key
-  },
-  tls: {
-    rejectUnauthorized: false   // Render ক্লাউড এনভায়রনমেন্টে কানেকশন সিকিউর রাখার জন্য
-  }
-});
-
-// Test email configuration on startup
-transporter.verify(function (error, success) {
-  if (error) {
-    console.log('❌ Email configuration error:', error);
-  } else {
-    console.log('✅ Brevo SMTP server is ready to send messages');
-  }
-});
-
 // ==================== HEALTH CHECK ENDPOINT ====================
+// Declared BEFORE the rate limiter so uptime pings never count against the limit.
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
+  res.status(200).json({
+    status: 'OK',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     message: 'Portfolio server is running smoothly'
   });
 });
 
+// ==================== RATE LIMITING ====================
+// Prevent brute force / abuse on contact endpoint
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many requests from this IP, please try again later.' }
+});
+app.use(limiter);
+
+// ==================== BREVO SMTP CONFIGURATION ====================
+// NOTE: Render free web services block outbound SMTP ports 25, 465 and 587.
+// Brevo also supports port 2525, which works on Render. Override with SMTP_PORT if needed.
+const SMTP_PORT = parseInt(process.env.SMTP_PORT, 10) || 2525;
+
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp-relay.brevo.com',
+  port: SMTP_PORT,
+  secure: false, // STARTTLS is used automatically on non-SSL ports
+  pool: true,
+  maxConnections: 2,
+  maxMessages: Infinity,
+  connectionTimeout: 15000,
+  greetingTimeout: 15000,
+  socketTimeout: 20000,
+  auth: {
+    user: process.env.EMAIL_USER, // Brevo SMTP login e.g. xxxx@smtp-brevo.com
+    pass: process.env.EMAIL_PASS, // Brevo SMTP key
+  },
+  tls: {
+    rejectUnauthorized: false
+  }
+});
+
+// Test email configuration on startup (non-blocking)
+transporter.verify(function (error) {
+  if (error) {
+    console.log('[EMAIL] Configuration error:', error.message);
+  } else {
+    console.log(`[EMAIL] Brevo SMTP server is ready (port ${SMTP_PORT})`);
+  }
+});
+
+// ==================== EMAIL TEMPLATES ====================
+// Table-based layout with inline styles for maximum email client compatibility.
+const BRAND = {
+  primary: '#6d28d9',
+  primaryDark: '#4c1d95',
+  navy: '#0f0a2e',
+  text: '#1f2937',
+  muted: '#6b7280',
+  border: '#e5e7eb',
+  bg: '#f3f4f6',
+  card: '#ffffff',
+  soft: '#f9fafb'
+};
+
+const FONT = "'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+
+function formatDateTime(date) {
+  try {
+    return date.toLocaleString('en-GB', {
+      dateStyle: 'medium',
+      timeStyle: 'short',
+      timeZone: 'Asia/Dhaka'
+    }) + ' (BST)';
+  } catch {
+    return date.toISOString();
+  }
+}
+
+function infoRow(label, valueHtml, isLast) {
+  return `
+    <tr>
+      <td style="padding: 14px 0; ${isLast ? '' : `border-bottom: 1px solid ${BRAND.border};`} width: 90px; vertical-align: top; font-family: ${FONT}; font-size: 11px; font-weight: 700; letter-spacing: 1.2px; text-transform: uppercase; color: ${BRAND.muted};">
+        ${label}
+      </td>
+      <td style="padding: 14px 0; ${isLast ? '' : `border-bottom: 1px solid ${BRAND.border};`} vertical-align: top; font-family: ${FONT}; font-size: 15px; color: ${BRAND.text};">
+        ${valueHtml}
+      </td>
+    </tr>`;
+}
+
+function buildOwnerEmail({ safeName, safeNumber, safeEmail, safeMessage }) {
+  const messageHtml = safeMessage.replace(/\r?\n/g, '<br>');
+  const receivedAt = formatDateTime(new Date());
+
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="x-apple-disable-message-reformatting">
+  <title>New Portfolio Message</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: ${BRAND.bg};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: ${BRAND.bg}; padding: 32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 620px; background-color: ${BRAND.card}; border-radius: 14px; overflow: hidden; border: 1px solid ${BRAND.border};">
+
+          <!-- Accent bar -->
+          <tr>
+            <td style="height: 5px; background-color: ${BRAND.primary}; background-image: linear-gradient(90deg, ${BRAND.primaryDark}, ${BRAND.primary}, #8b5cf6); font-size: 0; line-height: 0;">&nbsp;</td>
+          </tr>
+
+          <!-- Header -->
+          <tr>
+            <td style="background-color: ${BRAND.navy}; padding: 36px 36px 32px 36px;">
+              <p style="margin: 0 0 10px 0; font-family: ${FONT}; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: #a78bfa;">
+                Portfolio Inbox
+              </p>
+              <h1 style="margin: 0 0 8px 0; font-family: ${FONT}; font-size: 26px; line-height: 1.3; font-weight: 700; color: #ffffff;">
+                New message from ${safeName}
+              </h1>
+              <p style="margin: 0; font-family: ${FONT}; font-size: 14px; line-height: 1.6; color: #c4b5fd;">
+                Someone reached out through your portfolio website.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Contact details -->
+          <tr>
+            <td style="padding: 32px 36px 8px 36px;">
+              <p style="margin: 0 0 6px 0; font-family: ${FONT}; font-size: 13px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: ${BRAND.primary};">
+                Contact Details
+              </p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                ${infoRow('Name', `<strong>${safeName}</strong>`, false)}
+                ${infoRow('Email', `<a href="mailto:${safeEmail}" style="color: ${BRAND.primary}; text-decoration: none; font-weight: 600;">${safeEmail}</a>`, false)}
+                ${infoRow('Phone', `<a href="tel:${safeNumber}" style="color: ${BRAND.primary}; text-decoration: none; font-weight: 600;">${safeNumber}</a>`, false)}
+                ${infoRow('Received', receivedAt, true)}
+              </table>
+            </td>
+          </tr>
+
+          <!-- Message -->
+          <tr>
+            <td style="padding: 24px 36px 8px 36px;">
+              <p style="margin: 0 0 12px 0; font-family: ${FONT}; font-size: 13px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: ${BRAND.primary};">
+                Message
+              </p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="background-color: ${BRAND.soft}; border: 1px solid ${BRAND.border}; border-left: 4px solid ${BRAND.primary}; border-radius: 8px; padding: 20px 22px; font-family: ${FONT}; font-size: 15px; line-height: 1.75; color: ${BRAND.text};">
+                    ${messageHtml}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- CTA -->
+          <tr>
+            <td align="left" style="padding: 24px 36px 36px 36px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="background-color: ${BRAND.primary}; border-radius: 8px;">
+                    <a href="mailto:${safeEmail}" style="display: inline-block; padding: 13px 26px; font-family: ${FONT}; font-size: 14px; font-weight: 700; color: #ffffff; text-decoration: none; letter-spacing: 0.3px;">
+                      Reply to ${safeName} &rarr;
+                    </a>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: ${BRAND.soft}; border-top: 1px solid ${BRAND.border}; padding: 20px 36px; text-align: center;">
+              <p style="margin: 0; font-family: ${FONT}; font-size: 12px; line-height: 1.6; color: ${BRAND.muted};">
+                This message was sent from the contact form on your portfolio website.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+function buildUserConfirmationEmail({ safeName }) {
+  const year = new Date().getFullYear();
+
+  const step = (num, title, desc, isLast) => `
+    <tr>
+      <td style="padding: 0 0 ${isLast ? '0' : '18px'} 0;">
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
+          <tr>
+            <td width="36" valign="top">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td align="center" valign="middle" width="28" height="28" style="width: 28px; height: 28px; background-color: ${BRAND.primary}; border-radius: 14px; font-family: ${FONT}; font-size: 13px; font-weight: 700; color: #ffffff; text-align: center;">
+                    ${num}
+                  </td>
+                </tr>
+              </table>
+            </td>
+            <td valign="top" style="font-family: ${FONT};">
+              <p style="margin: 0 0 3px 0; font-size: 15px; font-weight: 700; color: ${BRAND.text};">${title}</p>
+              <p style="margin: 0; font-size: 14px; line-height: 1.6; color: ${BRAND.muted};">${desc}</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>`;
+
+  return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="x-apple-disable-message-reformatting">
+  <title>Thank You for Reaching Out</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: ${BRAND.bg};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: ${BRAND.bg}; padding: 32px 12px;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 620px; background-color: ${BRAND.card}; border-radius: 14px; overflow: hidden; border: 1px solid ${BRAND.border};">
+
+          <!-- Accent bar -->
+          <tr>
+            <td style="height: 5px; background-color: ${BRAND.primary}; background-image: linear-gradient(90deg, ${BRAND.primaryDark}, ${BRAND.primary}, #8b5cf6); font-size: 0; line-height: 0;">&nbsp;</td>
+          </tr>
+
+          <!-- Header -->
+          <tr>
+            <td style="background-color: ${BRAND.navy}; padding: 44px 36px 38px 36px; text-align: center;">
+              <p style="margin: 0 0 12px 0; font-family: ${FONT}; font-size: 11px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; color: #a78bfa;">
+                ${escapeHTML(OWNER_NAME)}
+              </p>
+              <h1 style="margin: 0 0 10px 0; font-family: ${FONT}; font-size: 28px; line-height: 1.3; font-weight: 700; color: #ffffff;">
+                Thank you, ${safeName}
+              </h1>
+              <p style="margin: 0; font-family: ${FONT}; font-size: 15px; line-height: 1.6; color: #c4b5fd;">
+                Your message has been received successfully.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding: 36px 36px 8px 36px;">
+              <p style="margin: 0 0 14px 0; font-family: ${FONT}; font-size: 16px; line-height: 1.7; color: ${BRAND.text};">
+                Hi ${safeName},
+              </p>
+              <p style="margin: 0; font-family: ${FONT}; font-size: 15px; line-height: 1.75; color: ${BRAND.muted};">
+                Thank you for taking the time to get in touch through my portfolio website. I truly appreciate your interest, and I will read your message carefully.
+              </p>
+            </td>
+          </tr>
+
+          <!-- What happens next -->
+          <tr>
+            <td style="padding: 24px 36px 8px 36px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: ${BRAND.soft}; border: 1px solid ${BRAND.border}; border-radius: 10px;">
+                <tr>
+                  <td style="padding: 26px 26px 26px 26px;">
+                    <p style="margin: 0 0 20px 0; font-family: ${FONT}; font-size: 13px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase; color: ${BRAND.primary};">
+                      What happens next
+                    </p>
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      ${step('1', 'Review', 'I will go through your message and understand your requirements.', false)}
+                      ${step('2', 'Response', 'You will receive a reply from me within 24 hours.', true)}
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Sign-off -->
+          <tr>
+            <td style="padding: 28px 36px 40px 36px;">
+              <p style="margin: 0 0 4px 0; font-family: ${FONT}; font-size: 15px; line-height: 1.6; color: ${BRAND.muted};">
+                Best regards,
+              </p>
+              <p style="margin: 0; font-family: ${FONT}; font-size: 17px; font-weight: 700; color: ${BRAND.text};">
+                ${escapeHTML(OWNER_NAME)}
+              </p>
+              <p style="margin: 2px 0 0 0; font-family: ${FONT}; font-size: 13px; color: ${BRAND.primary}; font-weight: 600;">
+                Full Stack Web Developer
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: ${BRAND.navy}; padding: 22px 36px; text-align: center;">
+              <p style="margin: 0 0 4px 0; font-family: ${FONT}; font-size: 12px; color: #c4b5fd;">
+                &copy; ${year} ${escapeHTML(OWNER_NAME)}. All rights reserved.
+              </p>
+              <p style="margin: 0; font-family: ${FONT}; font-size: 11px; color: #8b7fc7;">
+                You are receiving this email because you submitted the contact form on my portfolio.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
 // ==================== CONTACT LOGIC FUNCTION ====================
 const handleContactForm = async (req, res) => {
   try {
-    console.log('📨 Received contact form submission:', req.body);
-    
-    const { name, number, email, message } = req.body;
+    const { name, number, email, message } = req.body || {};
+    console.log('[CONTACT] Submission received');
 
     // Enhanced validation
     if (!name || !number || !email || !message) {
       return res.status(400).json({ success: false, message: 'All fields are required' });
     }
 
-    if (name.trim().length < 2) {
+    if (String(name).trim().length < 2) {
       return res.status(400).json({ success: false, message: 'Name must be at least 2 characters long' });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    if (!emailRegex.test(String(email).trim())) {
       return res.status(400).json({ success: false, message: 'Please provide a valid email address' });
     }
 
@@ -132,148 +417,67 @@ const handleContactForm = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Please provide a valid phone number' });
     }
 
-    if (message.trim().length < 10) {
+    if (String(message).trim().length < 10) {
       return res.status(400).json({ success: false, message: 'Message must be at least 10 characters long' });
     }
 
-    if (message.trim().length > 1000) {
+    if (String(message).trim().length > 1000) {
       return res.status(400).json({ success: false, message: 'Message must be less than 1000 characters' });
     }
 
     // XSS Protection
-    const safeName = escapeHTML(name.trim());
+    const safeName = escapeHTML(String(name).trim());
     const safeNumber = escapeHTML(String(number).trim());
-    const safeEmail = escapeHTML(email.trim());
-    const safeMessage = escapeHTML(message.trim());
+    const safeEmail = escapeHTML(String(email).trim());
+    const safeMessage = escapeHTML(String(message).trim());
 
-    // ⚠️ গুরুত্বপূর্ণ নোট: EMAIL_FROM অবশ্যই আপনার Brevo অ্যাকাউন্টে "Sender" হিসেবে ভেরিফাইড ইমেইলটি হতে হবে।
+    // IMPORTANT: EMAIL_FROM must be a verified Sender in your Brevo account.
     const mailOptions = {
-      from: process.env.EMAIL_FROM, 
+      from: process.env.EMAIL_FROM,
       to: process.env.EMAIL_TO,
-      subject: `📧 New Portfolio Message from ${safeName}`,
-      html: `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>New Portfolio Contact</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', sans-serif; line-height: 1.6; color: #333; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 20px; }
-        .email-container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2); }
-        .email-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px 20px; text-align: center; color: white; }
-        .email-header h1 { font-size: 28px; font-weight: 600; margin-bottom: 10px; }
-        .email-body { padding: 30px; }
-        .contact-info { background: #f8f9fa; border-radius: 8px; padding: 20px; margin-bottom: 25px; border-left: 4px solid #667eea; }
-        .info-item { margin-bottom: 12px; display: flex; }
-        .info-label { font-weight: 600; color: #495057; min-width: 80px; }
-        .info-value { color: #212529; flex: 1; }
-        .message-section { background: #fff; border: 1px solid #e9ecef; border-radius: 8px; padding: 20px; }
-        .message-label { font-weight: 600; color: #495057; margin-bottom: 10px; font-size: 16px; }
-        .message-content { color: #212529; white-space: pre-wrap; }
-        .email-footer { background: #f8f9fa; padding: 20px; text-align: center; border-top: 1px solid #e9ecef; }
-    </style>
-</head>
-<body>
-    <div class="email-container">
-        <div class="email-header">
-            <h1>🎉 New Portfolio Message</h1>
-            <p>Someone reached out through your portfolio website</p>
-        </div>
-        <div class="email-body">
-            <div class="contact-info">
-                <div class="info-item"><span class="info-label">Name:</span><span class="info-value">${safeName}</span></div>
-                <div class="info-item"><span class="info-label">Phone:</span><span class="info-value"><a href="tel:${safeNumber}">${safeNumber}</a></span></div>
-                <div class="info-item"><span class="info-label">Email:</span><span class="info-value"><a href="mailto:${safeEmail}">${safeEmail}</a></span></div>
-                <div class="info-item"><span class="info-label">Time:</span><span class="info-value">${new Date().toLocaleString()}</span></div>
-            </div>
-            <div class="message-section">
-                <div class="message-label">Message Content:</div>
-                <div class="message-content">${safeMessage}</div>
-            </div>
-        </div>
-        <div class="email-footer">
-            <p style="color: #6c757d; font-size: 14px;">💼 Sent from portfolio contact form</p>
-        </div>
-    </div>
-</body>
-</html>
-      `,
+      replyTo: String(email).trim(),
+      subject: `New Portfolio Message from ${safeName}`,
+      html: buildOwnerEmail({ safeName, safeNumber, safeEmail, safeMessage })
     };
 
     const userConfirmationMail = {
       from: process.env.EMAIL_FROM,
-      to: email,
-      subject: '✅ Thank you for contacting Shuvro Rozario',
-      html: `
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Thank You Message</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', sans-serif; line-height: 1.6; color: #333; background: #f8f9fa; padding: 20px; }
-        .email-container { max-width: 600px; margin: 0 auto; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1); }
-        .email-header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 20px; text-align: center; color: white; }
-        .email-body { padding: 40px 30px; }
-        .next-steps { background: #f8f9fa; border-radius: 8px; padding: 25px; margin: 25px 0; }
-        .next-steps ul { list-style: none; padding: 0; }
-        .next-steps li { padding: 8px 0; padding-left: 25px; position: relative; }
-        .next-steps li:before { content: "✓"; position: absolute; left: 0; color: #28a745; font-weight: bold; }
-        .email-footer { background: #343a40; color: white; padding: 25px; text-align: center; }
-    </style>
-</head>
-<body>
-    <div class="email-container">
-        <div class="email-header">
-            <h1>Thank You, ${safeName}!</h1>
-            <p>I've received your message and will get back to you soon</p>
-        </div>
-        <div class="email-body">
-            <p style="font-size: 16px; color: #495057; text-align: center;">I appreciate you taking the time to contact me through my portfolio website.</p>
-            <div class="next-steps">
-                <h3>What happens next?</h3>
-                <ul>
-                    <li>I'll review your message carefully</li>
-                    <li>You'll receive a response within 24 hours</li>
-                </ul>
-            </div>
-            <div style="text-align: center; margin-top: 30px;">
-                <p><strong>Best regards,</strong><br>Shuvro Rozario</p>
-            </div>
-        </div>
-        <div class="email-footer">
-            <p>© ${new Date().getFullYear()} Shuvro Rozario. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-      `
+      to: String(email).trim(),
+      subject: `Thank you for contacting ${OWNER_NAME}`,
+      html: buildUserConfirmationEmail({ safeName })
     };
 
-    // Deliver emails concurrently
-    const results = await Promise.allSettled([
+    // Deliver both emails concurrently
+    const sendEmails = Promise.allSettled([
       transporter.sendMail(mailOptions),
       transporter.sendMail(userConfirmationMail)
-    ]);
-    
-    console.log(`✅ Email process status for ${safeName}:`, results.map(r => r.status));
-
-    if (results[0].status === 'rejected' && results[1].status === 'rejected') {
-      throw new Error(`Email dispatch failed entirely.`);
-    }
-
-    return res.status(200).json({ 
-      success: true,
-      message: 'Message received! A confirmation email will arrive shortly.' 
+    ]).then((results) => {
+      console.log(`[EMAIL] Delivery status for ${safeName}:`, results.map(r => r.status));
+      results.forEach((r, i) => {
+        if (r.status === 'rejected') {
+          console.error(`[EMAIL] ${i === 0 ? 'Owner' : 'User'} mail failed:`, r.reason && r.reason.message);
+        }
+      });
+      return results;
     });
-    
+
+    if (WAIT_FOR_EMAIL) {
+      // Slower, but the client only gets success if at least one email was delivered
+      const results = await sendEmails;
+      if (results[0].status === 'rejected' && results[1].status === 'rejected') {
+        throw new Error('Email dispatch failed entirely.');
+      }
+    }
+    // Otherwise: respond immediately, emails continue in the background
+
+    return res.status(200).json({
+      success: true,
+      message: 'Message received! A confirmation email will arrive shortly.'
+    });
+
   } catch (error) {
-    console.error('❌ Contact form error:', error);
-    return res.status(500).json({ 
+    console.error('[CONTACT] Contact form error:', error);
+    return res.status(500).json({
       success: false,
       message: 'Failed to send message. Please try again later.'
     });
@@ -354,18 +558,44 @@ app.get('/', (req, res) => {
 
 // ==================== SERVER STARTUP ====================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Portfolio server running on port ${PORT}`);
-  
-  const keepAliveUrl = process.env.KEEP_ALIVE_URL || `http://localhost:${PORT}/health`;
+
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[SERVER] Portfolio server running on port ${PORT}`);
+
+  // ---------- KEEP-ALIVE (prevents Render free-tier sleep) ----------
+  // Render automatically provides RENDER_EXTERNAL_URL (your public https URL).
+  // Pinging the PUBLIC url is what counts as inbound traffic. localhost does not.
+  const rawUrl = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+
+  if (!rawUrl) {
+    console.log('[KEEP-ALIVE] No public URL found (local environment). Self-ping disabled.');
+    return;
+  }
+
+  const keepAliveUrl = /\/health\/?$/.test(rawUrl)
+    ? rawUrl
+    : `${rawUrl.replace(/\/$/, '')}/health`;
+
   const ping = () => {
     try {
-      const client = keepAliveUrl.startsWith('https') ? require('https') : require('http');
-      const req = client.get(keepAliveUrl, (res) => { res.resume(); });
-      req.on('error', () => {});
-      req.setTimeout(8000, () => req.destroy());
-    } catch {}
+      const client = keepAliveUrl.startsWith('https') ? https : http;
+      const req = client.get(keepAliveUrl, (res) => {
+        console.log(`[KEEP-ALIVE] Ping ${keepAliveUrl} -> ${res.statusCode}`);
+        res.resume();
+      });
+      req.on('error', (err) => console.log('[KEEP-ALIVE] Ping failed:', err.message));
+      req.setTimeout(10000, () => req.destroy());
+    } catch (err) {
+      console.log('[KEEP-ALIVE] Ping error:', err.message);
+    }
   };
-  setInterval(ping, 14 * 60 * 1000);
-  ping();
+
+  // Render sleeps after 15 min of inactivity, so ping every 10 min
+  setInterval(ping, 10 * 60 * 1000);
+  setTimeout(ping, 5000);
+  console.log(`[KEEP-ALIVE] Self-ping enabled every 10 minutes -> ${keepAliveUrl}`);
 });
+
+// Prevent random 502 errors behind Render's load balancer
+server.keepAliveTimeout = 120 * 1000;
+server.headersTimeout = 121 * 1000;
