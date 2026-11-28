@@ -11,7 +11,7 @@ const https = require('https');
 const app = express();
 
 // ==================== CONSTANTS ====================
-const OWNER_NAME = process.env.OWNER_NAME || 'Shuvro Rozario';
+const OWNER_NAME = process.env.OWNER_NAME || 'M.Shuvo Rozario';
 const WAIT_FOR_EMAIL = process.env.WAIT_FOR_EMAIL === 'true'; // default: respond instantly
 
 // Render (and most hosts) sit behind a proxy. Needed for correct client IP + rate limiting.
